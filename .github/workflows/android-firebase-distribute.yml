@@ -1,0 +1,156 @@
+# Sablon: her Flutter repo .github/workflows/ altina kopyalanir.
+# Uzaktan: git push ([apk]) veya gh workflow run — yerel Flutter gerekmez.
+
+name: Android Firebase Distribute
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_notes:
+        description: "Firebase release notlari (istege bagli)"
+        required: false
+        default: ""
+  push:
+    branches:
+      - main
+
+concurrency:
+  group: android-firebase-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-distribute:
+    if: |
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'push' && (
+        contains(github.event.head_commit.message, '[apk]') ||
+        contains(github.event.head_commit.message, '[dagit]')
+      ))
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Verify Firebase secrets
+        env:
+          FIREBASE_ANDROID_APP_ID: ${{ secrets.FIREBASE_ANDROID_APP_ID }}
+          FIREBASE_SERVICE_ACCOUNT_JSON: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_JSON }}
+        run: |
+          if [ -z "$FIREBASE_ANDROID_APP_ID" ]; then
+            echo "::error::FIREBASE_ANDROID_APP_ID eksik"
+            exit 1
+          fi
+          if [ -z "$FIREBASE_SERVICE_ACCOUNT_JSON" ]; then
+            echo "::error::FIREBASE_SERVICE_ACCOUNT_JSON eksik"
+            exit 1
+          fi
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Cache pub
+        uses: actions/cache@v4
+        with:
+          path: ~/.pub-cache
+          key: pub-${{ runner.os }}-${{ hashFiles('pubspec.lock') }}
+          restore-keys: |
+            pub-${{ runner.os }}-
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: gradle
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Flutter pub get
+        run: flutter pub get
+
+      - name: google-services.json
+        env:
+          GOOGLE_SERVICES_JSON: ${{ secrets.GOOGLE_SERVICES_JSON }}
+        run: |
+          if [ -n "$GOOGLE_SERVICES_JSON" ]; then
+            printf '%s' "$GOOGLE_SERVICES_JSON" > android/app/google-services.json
+          fi
+
+      - name: Release signing
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+        run: |
+          if [ -z "$ANDROID_KEYSTORE_BASE64" ]; then
+            echo "::warning::Keystore secret yok — debug imza (guncellemeler veri kaybedebilir)."
+            exit 0
+          fi
+          echo "$ANDROID_KEYSTORE_BASE64" | base64 -d > android/app/upload-keystore.jks
+          {
+            echo "storePassword=$ANDROID_KEYSTORE_PASSWORD"
+            echo "keyPassword=$ANDROID_KEY_PASSWORD"
+            echo "keyAlias=$ANDROID_KEY_ALIAS"
+            echo "storeFile=upload-keystore.jks"
+          } > android/key.properties
+
+      - name: Version from pubspec
+        id: version
+        run: |
+          VERSION_LINE=$(grep '^version:' pubspec.yaml | head -1 | sed 's/version: //' | tr -d ' ')
+          VERSION_NAME="${VERSION_LINE%%+*}"
+          echo "name=$VERSION_NAME" >> "$GITHUB_OUTPUT"
+          echo "code=${{ github.run_number }}" >> "$GITHUB_OUTPUT"
+
+      - name: Build release APK
+        run: |
+          flutter build apk --release \
+            --target-platform android-arm64 \
+            --no-pub \
+            --build-name="${{ steps.version.outputs.name }}" \
+            --build-number="${{ steps.version.outputs.code }}"
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-release-apk
+          path: build/app/outputs/flutter-apk/app-release.apk
+          retention-days: 14
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_JSON }}
+
+      - name: Firebase App Distribution
+        env:
+          FIREBASE_ANDROID_APP_ID: ${{ secrets.FIREBASE_ANDROID_APP_ID }}
+          FIREBASE_TESTER_GROUPS: ${{ secrets.FIREBASE_TESTER_GROUPS }}
+          FIREBASE_TESTER_EMAILS: ${{ secrets.FIREBASE_TESTER_EMAILS }}
+        run: |
+          if [ -n "${{ github.event.inputs.release_notes }}" ]; then
+            NOTES="${{ github.event.inputs.release_notes }}"
+          else
+            NOTES="Build #${{ github.run_number }} — ${GITHUB_SHA::7}"
+          fi
+          ARGS=(
+            appdistribution:distribute
+            build/app/outputs/flutter-apk/app-release.apk
+            --app "$FIREBASE_ANDROID_APP_ID"
+            --release-notes "$NOTES"
+          )
+          if [ -n "$FIREBASE_TESTER_GROUPS" ]; then
+            ARGS+=(--groups "$FIREBASE_TESTER_GROUPS")
+          fi
+          if [ -n "$FIREBASE_TESTER_EMAILS" ]; then
+            ARGS+=(--testers "$FIREBASE_TESTER_EMAILS")
+          fi
+          if [ -z "$FIREBASE_TESTER_GROUPS" ] && [ -z "$FIREBASE_TESTER_EMAILS" ]; then
+            echo "::error::FIREBASE_TESTER_GROUPS veya FIREBASE_TESTER_EMAILS gerekli"
+            exit 1
+          fi
+          npx --yes firebase-tools@13.35.1 "${ARGS[@]}"
